@@ -47,7 +47,7 @@ def init_repo(repo_name: str) -> Path:
                 name TEXT, version TEXT, repo TEXT, type TEXT, license TEXT, sources TEXT,
                 hashes TEXT, depends TEXT, makedepends TEXT, build_script TEXT,
                 pre_install TEXT, post_install TEXT, pre_remove TEXT, post_remove TEXT,
-                architecture TEXT, provides TEXT, conflicts TEXT, obsoletes TEXT,
+                architecture TEXT, provides TEXT, conflicts TEXT, obsoletes TEXT, subpackages TEXT,
                 PRIMARY KEY (name, version, repo)
             );
             CREATE INDEX IF NOT EXISTS idx_pkg_name ON packages(name);
@@ -70,7 +70,6 @@ def sign_database(repo_name: str):
     if res.returncode != 0:
         print_err(f"Failed to sign repository database: {res.stderr.decode()}")
 
-#net ops
 async def fetch_and_hash_mirrors(session: aiohttp.ClientSession, source_string: str, sem: asyncio.Semaphore) -> str:
     mirrors = [u.strip() for u in source_string.split('|')]
     
@@ -122,6 +121,7 @@ async def batch_process_packages(repo_name: str, bh_files: list[Path]):
             sources = data.get("sources", [])
             provided_hashes = data.get("hashes", [])
             scripts = data.get("scripts", {})
+            subpkg_data = data.get("subpackages", {})
             
             if not all([name, version, sources, scripts.get("build")]):
                 print_err(f"Package TOML '{bh_file_path.name}' is missing required core fields.")
@@ -140,6 +140,8 @@ async def batch_process_packages(repo_name: str, bh_files: list[Path]):
                 fetched_hashes = await asyncio.gather(*hash_tasks)
                 hashes.extend(fetched_hashes)
 
+            subpkg_str = "|".join([f"{k}:{','.join(v)}" for k, v in subpkg_data.items()])
+
             packages_to_insert.append((
                 name, version, repo_name, 
                 data.get("type", "source"), data.get("license", "Unknown"),
@@ -148,7 +150,8 @@ async def batch_process_packages(repo_name: str, bh_files: list[Path]):
                 scripts.get("build", ""), scripts.get("pre_install", ""), scripts.get("post_install", ""),
                 scripts.get("pre_remove", ""), scripts.get("post_remove", ""),
                 data.get("architecture", "any"), data.get("provides", ""), 
-                data.get("conflicts", ""), data.get("obsoletes", "")
+                data.get("conflicts", ""), data.get("obsoletes", ""),
+                subpkg_str
             ))
 
     if packages_to_insert:
@@ -158,8 +161,8 @@ async def batch_process_packages(repo_name: str, bh_files: list[Path]):
                 INSERT OR REPLACE INTO packages 
                 (name, version, repo, type, license, sources, hashes, depends, makedepends, 
                 build_script, pre_install, post_install, pre_remove, post_remove, 
-                architecture, provides, conflicts, obsoletes) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                architecture, provides, conflicts, obsoletes, subpackages) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, packages_to_insert)
             
         print(f"\033[1;32m  [PASS]\033[0m Batch injection completed.")
@@ -177,7 +180,6 @@ def main():
         
     elif cmd == "add" and len(sys.argv) >= 4:
         repo_name = sys.argv[2]
-        #pass multiple .bh recipes at once
         target_files = [Path(f) for f in sys.argv[3:]]
         
         try:
