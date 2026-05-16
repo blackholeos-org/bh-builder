@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys
-import os
 import sqlite3
 import subprocess
 import asyncio
@@ -16,125 +15,179 @@ except ImportError:
 
 REPO_OUT_DIR = Path("out/repo")
 PRIV_KEY_PATH = Path("configs/keys/repo-priv.pem")
+CHUNK_SIZE = 131072  # 128KB
+MAX_CONCURRENT_DOWNLOADS = 16
 
+#TUI helpers
 def print_msg(msg: str):
     print(f"\033[1;36m==>\033[0m \033[1m{msg}\033[0m")
+
+def print_warn(msg: str):
+    print(f"\033[1;33m==> WARNING:\033[0m \033[1m{msg}\033[0m")
 
 def print_err(msg: str):
     print(f"\033[1;31m==> ERROR:\033[0m \033[1m{msg}\033[0m")
     sys.exit(1)
 
+#DB ops
 def get_db_path(repo_name: str) -> Path:
     return REPO_OUT_DIR / f"{repo_name}.db"
 
-def init_repo(repo_name: str):
+def init_repo(repo_name: str) -> Path:
     db_path = get_db_path(repo_name)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("""
+    
+    with sqlite3.connect(db_path, timeout=15.0) as conn:
+        conn.executescript("""
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
+            
             CREATE TABLE IF NOT EXISTS packages (
                 name TEXT, version TEXT, repo TEXT, type TEXT, license TEXT, sources TEXT,
                 hashes TEXT, depends TEXT, makedepends TEXT, build_script TEXT,
                 pre_install TEXT, post_install TEXT, pre_remove TEXT, post_remove TEXT,
+                architecture TEXT, provides TEXT, conflicts TEXT, obsoletes TEXT,
                 PRIMARY KEY (name, version, repo)
-            )
+            );
+            CREATE INDEX IF NOT EXISTS idx_pkg_name ON packages(name);
+            CREATE TABLE IF NOT EXISTS repo_meta (id INTEGER PRIMARY KEY, updated_at INTEGER);
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pkg_name ON packages(name)")
-        conn.execute("CREATE TABLE IF NOT EXISTS repo_meta (id INTEGER PRIMARY KEY, updated_at INTEGER)")
+    return db_path
 
 def sign_database(repo_name: str):
-    if not PRIV_KEY_PATH.exists():
-        print_err(f"Private key not found at {PRIV_KEY_PATH}")
-    
     db_path = get_db_path(repo_name)
     sig_path = REPO_OUT_DIR / f"{repo_name}.db.sig"
-    
+
     print_msg(f"Cryptographically signing {repo_name}.db...")
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("INSERT OR REPLACE INTO repo_meta (id, updated_at) VALUES (1, strftime('%s', 'now'))")
+    
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT OR REPLACE INTO repo_meta (id, updated_at) VALUES (1, strftime('%s', 'now'))")
+    conn.commit()
+    conn.close() 
 
     res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(PRIV_KEY_PATH), "-out", str(sig_path), str(db_path)], capture_output=True)
     if res.returncode != 0:
         print_err(f"Failed to sign repository database: {res.stderr.decode()}")
-    print("\033[1;32m  [PASS]\033[0m Repository signed successfully.")
 
-async def fetch_and_hash(session: aiohttp.ClientSession, url: str) -> str:
-    print_msg(f"Downloading source from {url} for verification...")
-    hasher = hashlib.sha256()
-    try:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.content.iter_chunked(65536):
-                hasher.update(chunk)
-        digest = hasher.hexdigest()
-        print(f"\033[1;32m  [HASH]\033[0m {digest}")
-        return digest
-    except Exception as e:
-        print_err(f"Network fetch failed for payload: {e}")
-
-async def process_package(repo_name: str, bh_file_path: Path):
-    if not bh_file_path.exists():
-        print_err(f"Package definition not found: {bh_file_path}")
+#net ops
+async def fetch_and_hash_mirrors(session: aiohttp.ClientSession, source_string: str, sem: asyncio.Semaphore) -> str:
+    mirrors = [u.strip() for u in source_string.split('|')]
     
-    print_msg(f"Parsing [{repo_name}] {bh_file_path.name}...")
-    with open(bh_file_path, "rb") as f:
-        data = tomllib.load(f)
+    for url in mirrors:
+        async with sem:
+            print_msg(f"Fetching header/hash for {url}...")
+            hasher = hashlib.sha256()
+            try:
+                timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=15)
+                
+                async with session.get(url, timeout=timeout, allow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        hasher.update(chunk)
+                        
+                digest = hasher.hexdigest()
+                print(f"\033[1;32m  [HASH]\033[0m {digest}")
+                return digest
+                
+            except asyncio.TimeoutError:
+                print_warn(f"Mirror timeout ({url})")
+            except aiohttp.ClientError as e:
+                print_warn(f"Mirror unreachable ({url}): {e}")
+            except Exception as e:
+                print_warn(f"Unexpected IO error ({url}): {e}")
+                
+    print_err(f"Network fetch failed. All mirrors exhausted for: {source_string}")
 
-    name = data.get("name")
-    version = data.get("version")
-    pkg_type = data.get("type", "source")
-    license_str = data.get("license", "Unknown")
-    depends = data.get("depends", "")
-    makedepends = data.get("makedepends", "")
-    sources = data.get("sources", [])
-    provided_hashes = data.get("hashes", [])
-    scripts = data.get("scripts", {})
+async def batch_process_packages(repo_name: str, bh_files: list[Path]):
+    db_path = init_repo(repo_name)
+    packages_to_insert = []
+    
+    connector = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
+    headers = {"User-Agent": "bhpkg/1.0 (Blackhole OS Builder) aiohttp"}
+    sem = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    
+    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+        for bh_file_path in bh_files:
+            if not bh_file_path.exists():
+                print_warn(f"Package definition not found, skipping: {bh_file_path}")
+                continue
+            
+            print_msg(f"Parsing [{repo_name}] {bh_file_path.name}...")
+            with open(bh_file_path, "rb") as f:
+                data = tomllib.load(f)
 
-    build_script = scripts.get("build", "")
-    pre_install = scripts.get("pre_install", "")
-    post_install = scripts.get("post_install", "")
-    pre_remove = scripts.get("pre_remove", "")
-    post_remove = scripts.get("post_remove", "")
+            name = data.get("name")
+            version = data.get("version")
+            sources = data.get("sources", [])
+            provided_hashes = data.get("hashes", [])
+            scripts = data.get("scripts", {})
+            
+            if not all([name, version, sources, scripts.get("build")]):
+                print_err(f"Package TOML '{bh_file_path.name}' is missing required core fields.")
 
-    if not all([name, version, sources, build_script]):
-        print_err("Package TOML is missing required core fields.")
+            hash_tasks = []
+            hashes = []
+            
+            for i, url_str in enumerate(sources):
+                if i < len(provided_hashes):
+                    hashes.append(provided_hashes[i])
+                    print(f"\033[1;32m  [SKIP]\033[0m Offline hash applied for source {i+1}")
+                else:
+                    hash_tasks.append(fetch_and_hash_mirrors(session, url_str, sem))
+            
+            if hash_tasks:
+                fetched_hashes = await asyncio.gather(*hash_tasks)
+                hashes.extend(fetched_hashes)
 
-    hashes = []
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for i, url in enumerate(sources):
-            if i < len(provided_hashes):
-                hashes.append(provided_hashes[i])
-                print(f"\033[1;32m  [SKIP]\033[0m Using offline hash for source {i+1}")
-            else:
-                tasks.append(fetch_and_hash(session, url))
-        
-        if tasks:
-            fetched_hashes = await asyncio.gather(*tasks)
-            hashes.extend(fetched_hashes)
+            packages_to_insert.append((
+                name, version, repo_name, 
+                data.get("type", "source"), data.get("license", "Unknown"),
+                ",".join(sources), ",".join(hashes),
+                data.get("depends", ""), data.get("makedepends", ""),
+                scripts.get("build", ""), scripts.get("pre_install", ""), scripts.get("post_install", ""),
+                scripts.get("pre_remove", ""), scripts.get("post_remove", ""),
+                data.get("architecture", "any"), data.get("provides", ""), 
+                data.get("conflicts", ""), data.get("obsoletes", "")
+            ))
 
-    with sqlite3.connect(get_db_path(repo_name)) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO packages 
-            (name, version, repo, type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (name, version, repo_name, pkg_type, license_str, ",".join(sources), ",".join(hashes), depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove))
-    print(f"\033[1;32m  [PASS]\033[0m {name} injected into {repo_name}.db mirror.")
+    if packages_to_insert:
+        print_msg(f"Committing {len(packages_to_insert)} package(s) to {repo_name}.db...")
+        with sqlite3.connect(db_path, timeout=15.0) as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO packages 
+                (name, version, repo, type, license, sources, hashes, depends, makedepends, 
+                build_script, pre_install, post_install, pre_remove, post_remove, 
+                architecture, provides, conflicts, obsoletes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, packages_to_insert)
+            
+        print(f"\033[1;32m  [PASS]\033[0m Batch injection completed.")
 
 def main():
     if len(sys.argv) < 2:
-        print("\033[1;36mBlackholeOS Repository Builder (bh-builder)\033[0m\nUsage:\n  bh-builder init <repo>\n  bh-builder add <repo> <pkg.bh>\n  bh-builder sign <repo>")
+        print("\033[1;36mBlackholeOS Repository Builder (bh-builder)\033[0m")
+        print("Usage:\n  bh-builder init <repo>\n  bh-builder add <repo> <pkg.bh> [pkg2.bh ...]\n  bh-builder sign <repo>")
         sys.exit(0)
 
     cmd = sys.argv[1]
+    
     if cmd == "init" and len(sys.argv) >= 3:
         init_repo(sys.argv[2])
+        
     elif cmd == "add" and len(sys.argv) >= 4:
         repo_name = sys.argv[2]
-        init_repo(repo_name)
-        asyncio.run(process_package(repo_name, Path(sys.argv[3])))
+        #pass multiple .bh recipes at once
+        target_files = [Path(f) for f in sys.argv[3:]]
+        
+        try:
+            asyncio.run(batch_process_packages(repo_name, target_files))
+        except KeyboardInterrupt:
+            print_err("Operation aborted by user.")
+            
     elif cmd == "sign" and len(sys.argv) >= 3:
         sign_database(sys.argv[2])
+        
     else:
         print_err("Invalid arguments. Run without arguments for help.")
 
