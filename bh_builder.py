@@ -5,6 +5,7 @@ import subprocess
 import asyncio
 import hashlib
 import aiohttp
+import time
 from pathlib import Path
 
 try:
@@ -61,12 +62,20 @@ def sign_database(repo_name: str):
 
     print_msg(f"Cryptographically signing {repo_name}.db...")
     
+    current_time = int(time.time())
     conn = sqlite3.connect(db_path)
-    conn.execute("INSERT OR REPLACE INTO repo_meta (id, updated_at) VALUES (1, strftime('%s', 'now'))")
+    conn.execute(f"INSERT OR REPLACE INTO repo_meta (id, updated_at) VALUES (1, {current_time})")
+    conn.execute(f"PRAGMA user_version = {current_time}")
     conn.commit()
     conn.close() 
 
-    res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(PRIV_KEY_PATH), "-out", str(sig_path), str(db_path)], capture_output=True)
+    res = subprocess.run([
+        "openssl", "dgst", "-sha256", 
+        "-sigopt", "rsa_padding_mode:pss", 
+        "-sigopt", "rsa_pss_saltlen:-1", 
+        "-sign", str(PRIV_KEY_PATH), 
+        "-out", str(sig_path), str(db_path)
+    ], capture_output=True)
     if res.returncode != 0:
         print_err(f"Failed to sign repository database: {res.stderr.decode()}")
 
